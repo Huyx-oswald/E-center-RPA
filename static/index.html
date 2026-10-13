@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lanyin-rpa</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b35; --fg:#e6e9ef; --mut:#8b93a3; --acc:#4f8cff; --ok:#3fb950; --err:#f85149; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,-apple-system,"PingFang SC",sans-serif; background:var(--bg); color:var(--fg); display:flex; height:100vh; }
+  button { font:inherit; cursor:pointer; border:1px solid var(--line); background:var(--panel); color:var(--fg); border-radius:6px; padding:6px 12px; }
+  button:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
+  button.danger:hover { border-color:var(--err); color:var(--err); }
+  input, select { font:inherit; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  aside { width:240px; border-right:1px solid var(--line); display:flex; flex-direction:column; }
+  aside h1 { font-size:15px; margin:0; padding:14px 16px; border-bottom:1px solid var(--line); }
+  .flows { overflow:auto; flex:1; }
+  .flows .item { padding:10px 16px; border-bottom:1px solid var(--line); cursor:pointer; }
+  .flows .item:hover { background:var(--panel); }
+  .flows .item.active { background:var(--panel); border-left:3px solid var(--acc); }
+  main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+  .head { display:flex; gap:8px; align-items:center; padding:14px 20px; border-bottom:1px solid var(--line); }
+  .head input.name { flex:1; }
+  .body { display:flex; flex:1; overflow:hidden; }
+  .editor { flex:1; overflow:auto; padding:16px 20px; }
+  .runs { width:38%; min-width:320px; border-left:1px solid var(--line); display:flex; flex-direction:column; overflow:hidden; }
+  .step { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  .step select { width:110px; flex:none; }
+  .step input { flex:1; min-width:0; }
+  .step button { padding:6px 8px; }
+  .muted { color:var(--mut); }
+  pre { white-space:pre-wrap; word-break:break-word; margin:0; }
+  .runs .list { max-height:38%; overflow:auto; border-bottom:1px solid var(--line); }
+  .runs .run { padding:8px 16px; border-bottom:1px solid var(--line); cursor:pointer; display:flex; justify-content:space-between; gap:8px; }
+  .run .status.success { color:var(--ok); } .run .status.error { color:var(--err); } .run .status.running { color:var(--acc); }
+  .detail { padding:14px 16px; overflow:auto; flex:1; }
+  .detail img { max-width:100%; border:1px solid var(--line); border-radius:6px; margin-top:8px; }
+  .empty { color:var(--mut); padding:40px 20px; text-align:center; }
+</style>
+</head>
+<body>
+<aside>
+  <h1>lanyin-rpa</h1>
+  <div class="flows" id="flowList"></div>
+  <div style="padding:12px 16px; border-top:1px solid var(--line);">
+    <button class="primary" style="width:100%" onclick="newFlow()">+ 新建流程</button>
+  </div>
+</aside>
+<main>
+  <div class="head">
+    <input class="name" id="flowName" placeholder="流程名称">
+    <button class="primary" onclick="saveFlow()">保存</button>
+    <button onclick="runFlow()">▶ 运行</button>
+    <button class="danger" onclick="deleteFlow()">删除</button>
+  </div>
+  <div class="body">
+    <div class="editor" id="editor"></div>
+    <div class="runs">
+      <div style="padding:10px 16px; border-bottom:1px solid var(--line);" class="muted">运行记录</div>
+      <div class="list" id="runList"></div>
+      <div class="detail" id="runDetail"><div class="empty">选择一次运行查看日志</div></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const TYPES = {
+  goto:       [["url","URL"]],
+  click:      [["selector","选择器"]],
+  fill:       [["selector","选择器"],["value","内容"]],
+  wait:       [["selector","选择器(可选)"],["ms","毫秒(可选)"]],
+  extract:    [["selector","选择器"],["name","变量名"]],
+  screenshot: [],
+};
+let flows = [], current = null, pollTimer = null;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.statusText);
+  return r.status === 204 ? null : r.json();
+}
+
+async function loadFlows() {
+  flows = await api('/api/flows');
+  const el = document.getElementById('flowList');
+  if (!flows.length) { el.innerHTML = '<div class="empty">还没有流程</div>'; return; }
+  el.innerHTML = flows.map(f =>
+    `<div class="item ${current && current.id===f.id ? 'active':''}" onclick="selectFlow(${f.id})">
+       ${escapeHtml(f.name)}<div class="muted">${f.steps.length} 步</div>
+     </div>`).join('');
+}
+
+function escapeHtml(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function selectFlow(id) {
+  current = flows.find(f => f.id === id);
+  document.getElementById('flowName').value = current.name;
+  renderSteps();
+  loadRuns();
+  loadFlows();
+}
+
+function newFlow() {
+  current = { id: null, name: '新流程', steps: [] };
+  document.getElementById('flowName').value = current.name;
+  renderSteps();
+  document.getElementById('runList').innerHTML = '';
+  document.getElementById('runDetail').innerHTML = '<div class="empty">未保存</div>';
+}
+
+function renderSteps() {
+  const el = document.getElementById('editor');
+  if (!current) { el.innerHTML = '<div class="empty">左侧选择或新建一个流程</div>'; return; }
+  const rows = current.steps.map((s, i) => {
+    const fields = TYPES[s.type].map(([k, label]) =>
+      `<input placeholder="${label}" value="${escapeHtml(s[k] ?? '')}"
+              oninput="setField(${i},'${k}',this.value)">`).join('');
+    const opts = Object.keys(TYPES).map(t =>
+      `<option ${t===s.type?'selected':''}>${t}</option>`).join('');
+    return `<div class="step">
+      <select onchange="setType(${i},this.value)">${opts}</select>
+      ${fields}
+      <button onclick="moveStep(${i},-1)" title="上移">↑</button>
+      <button onclick="delStep(${i})" title="删除">✕</button>
+    </div>`;
+  }).join('');
+  el.innerHTML = rows + `<button onclick="addStep()">+ 添加步骤</button>`;
+}
+
+function addStep() { current.steps.push({ type:'goto', url:'' }); renderSteps(); }
+function delStep(i) { current.steps.splice(i,1); renderSteps(); }
+function moveStep(i,d) { const j=i+d; if(j<0||j>=current.steps.length) return;
+  [current.steps[i],current.steps[j]]=[current.steps[j],current.steps[i]]; renderSteps(); }
+function setType(i,t){ current.steps[i]={type:t}; renderSteps(); }
+function setField(i,k,v){ current.steps[i][k]=v; }
+
+async function saveFlow() {
+  const name = document.getElementById('flowName').value.trim();
+  if (!name) return alert('请填流程名称');
+  const saved = await api('/api/flows', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ id: current.id, name, steps: current.steps }),
+  });
+  current = saved;
+  await loadFlows();
+  selectFlow(saved.id);
+}
+
+async function deleteFlow() {
+  if (!current || !current.id) return;
+  if (!confirm('删除该流程？')) return;
+  await api(`/api/flows/${current.id}`, { method:'DELETE' });
+  current = null; document.getElementById('flowName').value=''; renderSteps(); loadFlows();
+}
+
+async function runFlow() {
+  if (!current || !current.id) return alert('先保存流程再运行');
+  const { run_id } = await api(`/api/flows/${current.id}/run`, { method:'POST' });
+  await loadRuns();
+  watchRun(run_id);
+}
+
+async function loadRuns() {
+  if (!current || !current.id) return;
+  const runs = await api(`/api/flows/${current.id}/runs`);
+  document.getElementById('runList').innerHTML = runs.length ? runs.map(r =>
+    `<div class="run" onclick="watchRun(${r.id})">
+       <span>#${r.id}</span><span class="status ${r.status}">${r.status}</span>
+     </div>`).join('') : '<div class="empty">暂无</div>';
+}
+
+async function watchRun(runId) {
+  clearInterval(pollTimer);
+  const tick = async () => {
+    const run = await api(`/api/runs/${runId}`);
+    renderRun(run);
+    if (run.status !== 'running') { clearInterval(pollTimer); loadRuns(); }
+  };
+  await tick();
+  if ((await api(`/api/runs/${runId}`)).status === 'running')
+    pollTimer = setInterval(tick, 800);
+}
+
+function renderRun(run) {
+  const shot = run.screenshot ? `<img src="/screenshots/${run.screenshot}">` : '';
+  const res = Object.keys(run.result).length
+    ? `<pre class="muted">${escapeHtml(JSON.stringify(run.result, null, 2))}</pre>` : '';
+  document.getElementById('runDetail').innerHTML =
+    `<div><b>#${run.id}</b> <span class="status ${run.status}">${run.status}</span></div>
+     ${res}<pre>${escapeHtml(run.log)}</pre>${shot}`;
+}
+
+loadFlows();
+</script>
+</body>
+</html>
